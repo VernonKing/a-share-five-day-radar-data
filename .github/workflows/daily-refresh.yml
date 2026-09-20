@@ -1,0 +1,47 @@
+name: Daily A-share refresh
+
+on:
+  schedule:
+    # 15:40 Asia/Shanghai, Monday-Friday. Holidays and unchanged sessions produce no commit.
+    - cron: '40 7 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: a-share-daily-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install scanner dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Verify ranking and publication rules
+        run: python -m unittest discover -s . -p 'test_*.py'
+      - name: Calculate and validate the latest bundle
+        run: python runner.py
+      - name: Publish only a changed, validated session
+        run: |
+          if [ ! -f latest.json ]; then
+            echo "No validated bundle was produced" >&2
+            exit 1
+          fi
+          git add latest.json
+          if git diff --cached --quiet; then
+            echo "No new trading session; prior bundle preserved."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "data: refresh A-share session"
+          git push
