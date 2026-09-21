@@ -17,6 +17,19 @@ CST = timezone(timedelta(hours=8), name="Asia/Shanghai")
 RANK_COUNTS = {"chem_large": 3, "chem_small": 5, "oil": 5, "bj": 3}
 
 
+class SnapshotCoverageError(ValueError):
+    """A retryable snapshot failure caused by temporarily incomplete market data."""
+
+    def __init__(self, snapshot: dict[str, Any], errors: dict[str, str]):
+        super().__init__("snapshot coverage below 98%; preserving previous result")
+        self.diagnostics = {
+            "as_of": snapshot.get("as_of"),
+            "stats": snapshot.get("stats", {}),
+            "excluded_codes": snapshot.get("excluded_codes", {}),
+            "fetch_error_codes": sorted(errors),
+        }
+
+
 def now_china() -> datetime:
     return datetime.now(CST)
 
@@ -109,6 +122,9 @@ def build_bundle(root: Path) -> tuple[dict[str, Any], dict[str, str]]:
         "沪深日线优先用腾讯前复权序列，缺失时及北交所日线改用新浪前复权序列；未复权历史不得纳入排名。",
         "所有收益按同一组最近五个交易日的首日开盘至第五日收盘计算。",
     ]
+    stats = snapshot.get("stats", {})
+    if stats.get("universe", 0) and stats.get("eligible", 0) / stats["universe"] < 0.98:
+        raise SnapshotCoverageError(snapshot, errors)
     daily_site.validate_snapshot(snapshot)
     catalog = json.loads((root / "product_catalog.json").read_text(encoding="utf-8"))
     products = daily_site.build_products(catalog, snapshot["as_of"])
@@ -117,11 +133,44 @@ def build_bundle(root: Path) -> tuple[dict[str, Any], dict[str, str]]:
     return bundle, errors
 
 
+def build_bundle_with_retries(
+    root: Path,
+    *,
+    now_fn=None,
+    sleep_fn=None,
+    builder=None,
+    log_fn=print,
+    retry_seconds: int = 300,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Retry only temporary coverage failures through 16:30 China time."""
+    now_fn = now_fn or now_china
+    sleep_fn = sleep_fn or time.sleep
+    builder = builder or build_bundle
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return builder(root)
+        except SnapshotCoverageError as exc:
+            log_fn(json.dumps({"event": "coverage_retry", "attempt": attempt, **exc.diagnostics},
+                              ensure_ascii=False))
+            local = now_fn().astimezone(CST)
+            deadline = datetime.combine(local.date(), clock_time(16, 30), tzinfo=CST)
+            remaining = int((deadline - local).total_seconds())
+            if remaining <= 0:
+                raise
+            sleep_fn(min(retry_seconds, remaining))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Refresh the public five-session A-share data bundle")
     parser.add_argument("--output", type=Path, default=Path(__file__).with_name("latest.json"))
     args = parser.parse_args()
-    bundle, errors = build_bundle(Path(__file__).parent)
+    delay = seconds_until_release(now_china())
+    if delay:
+        print(f"Waiting {delay} seconds until 16:00 Asia/Shanghai before collecting market data", flush=True)
+        time.sleep(delay)
+    bundle, errors = build_bundle_with_retries(Path(__file__).parent)
     snapshot = bundle["snapshot"]
     previous_as_of = ""
     if args.output.exists():
@@ -133,10 +182,6 @@ def main() -> int:
         result["unchanged"] = "no new trading session"
         print(json.dumps(result, ensure_ascii=False))
         return 0
-    delay = seconds_until_release(now_china())
-    if delay:
-        print(f"Validated; waiting {delay} seconds until 16:00 Asia/Shanghai", flush=True)
-        time.sleep(delay)
     write_bundle(bundle, args.output)
     result["published"] = str(args.output)
     print(json.dumps(result, ensure_ascii=False))

@@ -2,6 +2,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 import tempfile
 from pathlib import Path
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -27,6 +28,111 @@ def sample_snapshot():
 
 
 class CloudPublicationTests(unittest.TestCase):
+    def test_low_coverage_uses_a_typed_retryable_error(self):
+        self.assertTrue(hasattr(runner, "SnapshotCoverageError"))
+        self.assertTrue(issubclass(runner.SnapshotCoverageError, ValueError))
+
+    def test_low_coverage_error_carries_stock_level_diagnostics(self):
+        snapshot = sample_snapshot()
+        snapshot["stats"]["eligible"] = 500
+        snapshot["excluded_codes"] = {"stale_history": ["600001.SH"]}
+        error = runner.SnapshotCoverageError(snapshot, {"600002.SH": "timeout"})
+        self.assertEqual(getattr(error, "diagnostics", None), {
+            "as_of": "2026-09-18",
+            "stats": snapshot["stats"],
+            "excluded_codes": {"stale_history": ["600001.SH"]},
+            "fetch_error_codes": ["600002.SH"],
+        })
+
+    def test_low_coverage_retries_after_five_minutes_then_returns_success(self):
+        self.assertTrue(hasattr(runner, "build_bundle_with_retries"))
+        current = datetime(2026, 9, 21, 16, 2, tzinfo=CST)
+        sleeps = []
+        attempts = []
+        logs = []
+        ready = ({"snapshot": sample_snapshot(), "products": {}}, {})
+
+        def clock():
+            return current
+
+        def sleep(seconds):
+            nonlocal current
+            sleeps.append(seconds)
+            current += timedelta(seconds=seconds)
+
+        def build(_root):
+            attempts.append(current)
+            if len(attempts) == 1:
+                sparse = sample_snapshot()
+                sparse["stats"]["eligible"] = 500
+                raise runner.SnapshotCoverageError(sparse, {"600002.SH": "timeout"})
+            return ready
+
+        result = runner.build_bundle_with_retries(
+            Path("."), now_fn=clock, sleep_fn=sleep, builder=build, log_fn=logs.append)
+        self.assertIs(result, ready)
+        self.assertEqual(sleeps, [300])
+        self.assertEqual(len(attempts), 2)
+        self.assertIn('"event": "coverage_retry"', logs[0])
+        self.assertIn('"fetch_error_codes": ["600002.SH"]', logs[0])
+
+    def test_low_coverage_retries_at_deadline_then_raises(self):
+        self.assertTrue(hasattr(runner, "build_bundle_with_retries"))
+        current = datetime(2026, 9, 21, 16, 29, tzinfo=CST)
+        sleeps = []
+        attempts = []
+
+        def clock():
+            return current
+
+        def sleep(seconds):
+            nonlocal current
+            sleeps.append(seconds)
+            current += timedelta(seconds=seconds)
+
+        def build(_root):
+            attempts.append(current)
+            sparse = sample_snapshot()
+            sparse["stats"]["eligible"] = 500
+            raise runner.SnapshotCoverageError(sparse, {})
+
+        with self.assertRaises(runner.SnapshotCoverageError):
+            runner.build_bundle_with_retries(
+                Path("."), now_fn=clock, sleep_fn=sleep, builder=build, log_fn=lambda _message: None)
+        self.assertEqual(sleeps, [60])
+        self.assertEqual(len(attempts), 2)
+
+    def test_main_waits_until_16_before_collecting_market_data(self):
+        with tempfile.NamedTemporaryFile(dir=Path(__file__).parent, suffix=".json", delete=False) as handle:
+            target = Path(handle.name)
+        current = datetime(2026, 9, 21, 15, 42, tzinfo=CST)
+        events = []
+
+        def clock():
+            return current
+
+        def sleep(seconds):
+            nonlocal current
+            events.append(("sleep", seconds))
+            current += timedelta(seconds=seconds)
+
+        def build(_root):
+            events.append(("build", current))
+            return {"snapshot": sample_snapshot(), "products": {}}, {}
+
+        try:
+            target.write_text('{"snapshot":{"as_of":"2026-09-17"}}', encoding="utf-8")
+            with patch.object(sys, "argv", ["runner.py", "--output", str(target)]), \
+                    patch.object(runner, "now_china", side_effect=clock), \
+                    patch.object(runner.time, "sleep", side_effect=sleep), \
+                    patch.object(runner, "build_bundle", side_effect=build), \
+                    patch.object(runner, "write_bundle"):
+                runner.main()
+            self.assertEqual(events[0], ("sleep", 18 * 60))
+            self.assertEqual(events[1][0], "build")
+        finally:
+            target.unlink(missing_ok=True)
+
     def test_sina_fallback_retries_only_transient_failures(self):
         first = ({"920175.BJ": {"bars": []}}, {"920175.BJ": {"name": "A"}}, {"920642.BJ": "temporary"})
         second = ({"920642.BJ": {"bars": []}}, {"920642.BJ": {"name": "B"}}, {})

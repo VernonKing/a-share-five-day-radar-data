@@ -163,6 +163,39 @@ class MarketSourceTests(unittest.TestCase):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_snapshot_records_every_excluded_code_by_reason(self) -> None:
+        days = ["2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18"]
+        full = {"bars": [bar(day, 10, 11) for day in days], "adjustment": "qfq"}
+        stale = {"bars": [bar(day, 10, 11) for day in days[:-1]], "adjustment": "qfq"}
+        histories = {
+            "600002.SH": stale,
+            "600003.SH": full,
+            "600004.SH": full,
+            "600005.SH": full,
+            "920001.BJ": {"bars": full["bars"], "adjustment": "raw_bj"},
+        }
+        quotes = {
+            "600002.SH": {"name": "stale history", "last_price": 11, "market_cap_yuan": 1,
+                           "quote_at": "2026-09-18 16:00:00"},
+            "600004.SH": {"name": "stale quote", "last_price": 11, "market_cap_yuan": 1,
+                           "quote_at": "2026-09-17 16:00:00"},
+            "600005.SH": {"name": "missing cap", "last_price": 11, "market_cap_yuan": None,
+                           "quote_at": "2026-09-18 16:00:00"},
+            "920001.BJ": {"name": "raw", "last_price": 11, "market_cap_yuan": 1,
+                           "quote_at": "2026-09-18 16:00:00"},
+        }
+        snapshot = daily_site.make_snapshot(
+            {"基础化工": ["600001.SH", "600002.SH", "600003.SH", "600004.SH", "600005.SH"],
+             "北交所": ["920001.BJ"]}, histories, quotes, "2026-09-18 16:00:00")
+        self.assertEqual(snapshot.get("excluded_codes"), {
+            "missing_history": ["600001.SH"],
+            "stale_history": ["600002.SH"],
+            "missing_quote": ["600003.SH"],
+            "stale_quote": ["600004.SH"],
+            "missing_cap": ["600005.SH"],
+            "unadjusted_history": ["920001.BJ"],
+        })
+
     def test_stale_quote_is_not_ranked_or_used_for_cap_bucket(self) -> None:
         days = ["2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18"]
         history = {"bars": [bar(day, 10, 11) for day in days], "adjustment": "qfq"}

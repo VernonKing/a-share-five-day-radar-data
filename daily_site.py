@@ -239,6 +239,9 @@ def make_snapshot(
         raise ValueError("fewer than five market sessions")
     stats = {"universe": 0, "eligible": 0, "missing_history": 0, "stale_history": 0,
              "missing_quote": 0, "stale_quote": 0, "missing_cap": 0, "unadjusted_history": 0}
+    excluded_codes = {key: [] for key in (
+        "missing_history", "stale_history", "missing_quote", "stale_quote", "missing_cap", "unadjusted_history"
+    )}
     rows: list[Row] = []
     seen: set[tuple[str, str]] = set()
     for group, codes in universe.items():
@@ -250,25 +253,31 @@ def make_snapshot(
             history = histories.get(code)
             if not history or not history.get("bars"):
                 stats["missing_history"] += 1
+                excluded_codes["missing_history"].append(code)
                 continue
             bars = sorted(history["bars"], key=lambda item: item["date"])
             by_date = {bar["date"]: bar for bar in bars}
             if any(day not in by_date for day in dates):
                 stats["stale_history"] += 1
+                excluded_codes["stale_history"].append(code)
                 continue
             if history.get("adjustment") == "raw_bj":
                 stats["unadjusted_history"] += 1
+                excluded_codes["unadjusted_history"].append(code)
                 continue
             quote = quotes.get(code)
             if not quote:
                 stats["missing_quote"] += 1
+                excluded_codes["missing_quote"].append(code)
                 continue
             if not str(quote.get("quote_at", "")).startswith(dates[-1]):
                 stats["stale_quote"] += 1
+                excluded_codes["stale_quote"].append(code)
                 continue
             cap = quote.get("market_cap_yuan")
             if cap is None:
                 stats["missing_cap"] += 1
+                excluded_codes["missing_cap"].append(code)
             daily = add_moving_averages(bars[-100:], (5, 10, 60))
             weekly = add_moving_averages(to_weekly_bars(bars[-130:]), (5, 10))
             rows.append({
@@ -284,7 +293,7 @@ def make_snapshot(
     return {
         "generated_at": generated_at, "as_of": dates[-1], "window_start": dates[0],
         "method": "first session open to fifth session close",
-        "groups": select_rankings(rows), "stats": stats,
+        "groups": select_rankings(rows), "stats": stats, "excluded_codes": excluded_codes,
     }
 
 
