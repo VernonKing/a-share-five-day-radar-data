@@ -28,7 +28,7 @@ def sample_snapshot():
                              "as_of": "2026-09-18", "window_start": "2026-09-14",
                              "quote_at": "2026-09-18 15:01:00",
                              "adjustment": "qfq_sina" if key == "bj" else (
-                                 "qfq_eastmoney" if key == "hk" else "qfq"),
+                                 "qfq_sina_hk" if key == "hk" else "qfq"),
                              "daily": [{"date": "2026-09-18"}], "weekly": [{"date": "2026-09-18"}]})
             sides[side] = rows
         groups[key] = sides
@@ -83,7 +83,8 @@ class CloudPublicationTests(unittest.TestCase):
         result = runner.build_bundle_with_retries(
             Path("."), now_fn=clock, sleep_fn=sleep, builder=build, log_fn=logs.append)
         self.assertIs(result, ready)
-        self.assertEqual(sleeps, [300])
+        self.assertEqual(sleeps, [180])
+        self.assertEqual(attempts[1].minute, 15)
         self.assertEqual(len(attempts), 2)
         self.assertIn('"event": "coverage_retry"', logs[0])
         self.assertIn('"fetch_error_codes": ["600002.SH"]', logs[0])

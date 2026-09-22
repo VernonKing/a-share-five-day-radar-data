@@ -128,6 +128,19 @@ def parse_tencent_quote(raw: str, code: str) -> dict[str, Any]:
     stamp_value = fields[30]
     stamp_format = "%Y/%m/%d %H:%M:%S" if "/" in stamp_value else "%Y%m%d%H%M%S"
     stamp = datetime.strptime(stamp_value, stamp_format).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        session_open = float(fields[5])
+        session_volume = float(fields[6])
+        session_high = float(fields[33])
+        session_low = float(fields[34])
+        session_traded = all(math.isfinite(value) and value > 0 for value in (
+            session_open, session_volume, session_high, session_low
+        ))
+    except (IndexError, TypeError, ValueError):
+        session_traded = False
+    session_bar = ({"date": stamp[:10], "open": session_open, "close": price,
+                    "high": session_high, "low": session_low, "volume": session_volume}
+                   if session_traded else None)
     is_hk = code.endswith(".HK")
     quoted_cap = float(fields[45]) * 100_000_000 if fields[45] else None
     if is_hk:
@@ -149,6 +162,8 @@ def parse_tencent_quote(raw: str, code: str) -> dict[str, Any]:
         "currency": currency,
         "market_cap_currency": currency,
         "quote_at": stamp,
+        "session_traded": session_traded,
+        "session_bar": session_bar,
         "quote_source": "Tencent quote",
         "quote_url": f"https://qt.gtimg.cn/q={tencent_symbol(code)}",
     }
@@ -184,6 +199,20 @@ def parse_tencent_history(payload: dict[str, Any], code: str) -> dict[str, Any]:
     if not bars:
         raise ValueError(f"no valid history for {code}")
     return {"bars": sorted(bars, key=lambda item: item["date"]), "adjustment": adjustment}
+
+
+def merge_live_session_bar(history: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
+    """Append a verified traded session when Sina's end-of-day row is delayed."""
+    session_bar = quote.get("session_bar") if quote.get("session_traded") is True else None
+    bars = list(history.get("bars") or [])
+    if not session_bar or (bars and str(bars[-1]["date"]) >= str(session_bar["date"])):
+        return history
+    merged = dict(history)
+    merged["bars"] = sorted([*bars, dict(session_bar)], key=lambda item: item["date"])[-260:]
+    adjustment = str(history.get("adjustment") or "")
+    merged["adjustment"] = adjustment if adjustment.endswith("_live") else f"{adjustment}_live"
+    merged["live_session_appended"] = True
+    return merged
 
 
 EASTMONEY_HK_HISTORY_URL = "https://33.push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -243,6 +272,45 @@ def parse_sina_adjusted_frame(frame: Any, code: str) -> dict[str, Any]:
         raise ValueError(f"Sina qfq history unavailable for {code}")
     return {"bars": sorted(bars, key=lambda item: item["date"]), "adjustment": "qfq_sina",
             "history_url": f"https://finance.sina.com.cn/realstock/company/{tencent_symbol(code)}/qfq.js"}
+
+
+def parse_sina_hk_adjusted_frame(frame: Any, code: str) -> dict[str, Any]:
+    """Normalize AkShare's Sina-backed HK forward-adjusted daily series."""
+    bars = []
+    for row in frame.to_dict("records"):
+        try:
+            bar = {"date": str(row["date"])[:10],
+                   **{key: float(row[key]) for key in ("open", "close", "high", "low", "volume")}}
+            if min(bar[key] for key in ("open", "close", "high", "low")) > 0:
+                bars.append(bar)
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not bars:
+        raise ValueError(f"Sina HK qfq history unavailable for {code}")
+    symbol = code.split(".", 1)[0]
+    return {"bars": sorted(bars, key=lambda item: item["date"])[-260:],
+            "adjustment": "qfq_sina_hk",
+            "history_url": f"https://stock.finance.sina.com.cn/hkstock/quotes/{symbol}.html"}
+
+
+def fetch_sina_hk_adjusted(code: str) -> dict[str, Any]:
+    """Fetch one HK stock's forward-adjusted daily series from Sina through AkShare."""
+    import akshare as ak
+    frame = ak.stock_hk_daily(symbol=code.split(".", 1)[0], adjust="qfq")
+    return parse_sina_hk_adjusted_frame(frame, code)
+
+
+def fetch_sina_adjusted_history(code: str) -> dict[str, Any]:
+    """Fetch a forward-adjusted Sina daily series for one A-share or HK stock."""
+    if code.endswith(".HK"):
+        return fetch_sina_hk_adjusted(code)
+    import akshare as ak
+    end = datetime.now(timezone(timedelta(hours=8))).date()
+    start = end - timedelta(days=550)
+    frame = ak.stock_zh_a_daily(symbol=tencent_symbol(code),
+                                start_date=start.strftime("%Y%m%d"),
+                                end_date=end.strftime("%Y%m%d"), adjust="qfq")
+    return parse_sina_adjusted_frame(frame, code)
 
 
 def fetch_sina_adjusted_fallback(codes: list[str]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, str]]:
@@ -309,9 +377,11 @@ def make_snapshot(
     if not market_windows:
         raise ValueError("fewer than five market sessions")
     stats = {"universe": 0, "eligible": 0, "missing_history": 0, "stale_history": 0,
-             "missing_quote": 0, "stale_quote": 0, "missing_cap": 0, "unadjusted_history": 0}
+             "no_trade": 0, "missing_quote": 0, "stale_quote": 0,
+             "missing_cap": 0, "unadjusted_history": 0}
     excluded_codes = {key: [] for key in (
-        "missing_history", "stale_history", "missing_quote", "stale_quote", "missing_cap", "unadjusted_history"
+        "missing_history", "stale_history", "no_trade", "missing_quote", "stale_quote",
+        "missing_cap", "unadjusted_history"
     )}
     rows: list[Row] = []
     seen: set[tuple[str, str]] = set()
@@ -330,18 +400,23 @@ def make_snapshot(
                 continue
             bars = sorted(history["bars"], key=lambda item: item["date"])
             by_date = {bar["date"]: bar for bar in bars}
-            if any(day not in by_date for day in dates):
-                stats["stale_history"] += 1
-                excluded_codes["stale_history"].append(code)
-                continue
-            if history.get("adjustment") == "raw_bj":
-                stats["unadjusted_history"] += 1
-                excluded_codes["unadjusted_history"].append(code)
-                continue
             quote = quotes.get(code)
             if not quote:
                 stats["missing_quote"] += 1
                 excluded_codes["missing_quote"].append(code)
+                continue
+            if any(day not in by_date for day in dates):
+                if (dates[-1] not in by_date and quote.get("session_traded") is False
+                        and str(quote.get("quote_at", "")).startswith(dates[-1])):
+                    stats["no_trade"] += 1
+                    excluded_codes["no_trade"].append(code)
+                else:
+                    stats["stale_history"] += 1
+                    excluded_codes["stale_history"].append(code)
+                continue
+            if history.get("adjustment") == "raw_bj":
+                stats["unadjusted_history"] += 1
+                excluded_codes["unadjusted_history"].append(code)
                 continue
             if not str(quote.get("quote_at", "")).startswith(dates[-1]):
                 stats["stale_quote"] += 1
@@ -386,7 +461,8 @@ def validate_snapshot(snapshot: dict[str, Any]) -> None:
     if not snapshot.get("as_of") or not snapshot.get("window_start"):
         raise ValueError("snapshot dates missing")
     stats = snapshot.get("stats", {})
-    if stats.get("universe", 0) and stats.get("eligible", 0) / stats["universe"] < 0.98:
+    active_universe = stats.get("universe", 0) - stats.get("no_trade", 0)
+    if active_universe and stats.get("eligible", 0) / active_universe < 0.98:
         raise ValueError("snapshot coverage below 98%; preserving previous result")
 
 
@@ -439,41 +515,35 @@ def load_universe(root: str | Path) -> dict[str, list[str]]:
 
 
 def fetch_market_data(codes: list[str], workers: int = 10) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, str]]:
-    """Fetch Tencent adjusted history and same-provider quotes with bounded retries."""
+    """Fetch Sina adjusted histories and Tencent quotes with bounded retries."""
     import requests
+    preloaded_histories: dict[str, dict[str, Any]] = {}
+    # The Sina adapters initialize an embedded JS runtime for adjustment factors.
+    # Warm it up on one stock before worker threads enter the adapter concurrently.
+    for warmup_code in codes:
+        try:
+            preloaded_histories[warmup_code] = fetch_sina_adjusted_history(warmup_code)
+            break
+        except Exception:
+            continue
 
     def fetch_one(code: str) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None, str | None]:
         symbol = tencent_symbol(code)
-        history_url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,260,qfq"
         quote_url = f"https://qt.gtimg.cn/q={symbol}"
         session = requests.Session()
         session.trust_env = False
         errors = []
+        history = preloaded_histories.get(code)
         for attempt in range(3):
             try:
-                if code.endswith(".HK"):
-                    h = session.get(EASTMONEY_HK_HISTORY_URL, params={
-                        "secid": f"116.{code.split('.')[0]}",
-                        "fields1": "f1,f2,f3,f4,f5,f6",
-                        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-                        "klt": "101", "fqt": "1", "end": "20500000", "lmt": "260",
-                    }, timeout=16)
-                    h.raise_for_status()
-                    history = parse_eastmoney_hk_history(h.json(), code)
-                else:
-                    h = session.get(history_url, timeout=16)
-                    h.raise_for_status()
-                    history = parse_tencent_history(h.json(), code)
-                if code.endswith(".BJ") and len(history["bars"]) < 60:
-                    sina = session.get("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData",
-                                       params={"symbol": symbol, "scale": "240", "ma": "no", "datalen": "260"}, timeout=16)
-                    sina.raise_for_status()
-                    history = parse_sina_bj_history(sina.json())
+                if history is None:
+                    history = fetch_sina_adjusted_history(code)
                 q = session.get(quote_url, timeout=12)
                 q.raise_for_status()
                 quote = parse_tencent_quote(q.content.decode("gbk", errors="replace"), code)
+                history = merge_live_session_bar(history, quote)
                 return code, history, quote, None
-            except (requests.RequestException, ValueError, KeyError) as exc:
+            except Exception as exc:
                 errors.append(f"{type(exc).__name__}: {exc}")
                 time.sleep(0.25 * (attempt + 1))
         return code, None, None, "; ".join(errors[-2:])
@@ -481,7 +551,8 @@ def fetch_market_data(codes: list[str], workers: int = 10) -> tuple[dict[str, di
     histories: dict[str, dict[str, Any]] = {}
     quotes: dict[str, dict[str, Any]] = {}
     errors: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    safe_workers = workers if preloaded_histories else 1
+    with ThreadPoolExecutor(max_workers=safe_workers) as pool:
         futures = {pool.submit(fetch_one, code): code for code in codes}
         for future in as_completed(futures):
             code, history, quote, error = future.result()
@@ -565,27 +636,22 @@ def main() -> int:
     universe = load_universe(root)
     codes = sorted({code for group_codes in universe.values() for code in group_codes})
     histories, quotes, errors = fetch_market_data(codes)
-    for _ in range(2):
+    for _ in range(1):
         if not errors:
             break
         time.sleep(1)
-        retry_histories, retry_quotes, retry_errors = fetch_market_data(list(errors), workers=3)
+        retry_histories, retry_quotes, retry_errors = fetch_market_data(list(errors), workers=8)
         histories.update(retry_histories)
         quotes.update(retry_quotes)
         errors = retry_errors
-    fallback_codes = sorted(set(errors) | {code for code in codes if code.endswith(".BJ")})
-    if fallback_codes:
-        fallback_histories, fallback_quotes, fallback_errors = fetch_sina_adjusted_fallback(fallback_codes)
-        histories.update(fallback_histories)
-        quotes.update(fallback_quotes)
-        errors = fallback_errors
     generated_at = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
     snapshot = make_snapshot(universe, histories, quotes, generated_at)
     snapshot["stats"]["fetch_errors"] = len(errors)
     snapshot["fetch_error_codes"] = sorted(errors)
     snapshot["source_notes"] = [
-        "行情、总股本：腾讯行情接口；市值=最新价×总股本。",
-        "沪深日线优先用腾讯前复权序列，缺失时及北交所日线改用新浪前复权序列；未复权历史不得纳入排名。",
+        "实时行情、总股本：腾讯行情接口；市值=最新价×总股本。",
+        "A股与港股日线使用新浪前复权序列；若当日日线延迟，仅在腾讯报价确认当日有成交时补入当日行情。",
+        "当日停牌或零成交股票不参与排名，并从有效覆盖率分母剔除；未复权历史不得纳入排名。",
         "所有收益按同一组最近五个交易日的首日开盘至第五日收盘计算。",
     ]
     target.parent.mkdir(parents=True, exist_ok=True)

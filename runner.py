@@ -64,9 +64,10 @@ def validate_bundle(bundle: dict[str, Any]) -> None:
                     raise ValueError(f"wrong market window in {bucket}/{side}: {row.get('code')}")
                 if not str(row.get("quote_at", "")).startswith(as_of):
                     raise ValueError(f"stale quote in {bucket}/{side}: {row.get('code')}")
-                if row.get("adjustment") not in {"qfq", "qfq_sina", "qfq_eastmoney"}:
+                if row.get("adjustment") not in {"qfq", "qfq_sina", "qfq_sina_live", "qfq_sina_hk",
+                                                 "qfq_sina_hk_live", "qfq_eastmoney"}:
                     raise ValueError(f"unadjusted history in {bucket}/{side}: {row.get('code')}")
-                if bucket == "bj" and row.get("adjustment") != "qfq_sina":
+                if bucket == "bj" and row.get("adjustment") not in {"qfq_sina", "qfq_sina_live"}:
                     raise ValueError(f"BJ adjusted history required: {row.get('code')}")
                 if not row.get("daily") or row["daily"][-1].get("date") != as_of or not row.get("weekly"):
                     raise ValueError(f"incomplete chart history in {bucket}/{side}: {row.get('code')}")
@@ -115,32 +116,26 @@ def build_bundle(root: Path) -> tuple[dict[str, Any], dict[str, str]]:
     universe = daily_site.load_universe(root)
     codes = sorted({code for group in universe.values() for code in group})
     histories, quotes, errors = daily_site.fetch_market_data(codes)
-    for _ in range(2):
+    for _ in range(1):
         if not errors:
             break
         time.sleep(1)
-        retry_histories, retry_quotes, retry_errors = daily_site.fetch_market_data(list(errors), workers=3)
+        retry_histories, retry_quotes, retry_errors = daily_site.fetch_market_data(list(errors), workers=8)
         histories.update(retry_histories)
         quotes.update(retry_quotes)
         errors = retry_errors
-    hk_errors = {code: message for code, message in errors.items() if code.endswith(".HK")}
-    fallback_codes = sorted({code for code in errors if not code.endswith(".HK")} |
-                            {code for code in codes if code.endswith(".BJ")})
-    if fallback_codes:
-        fallback_histories, fallback_quotes, fallback_errors = fetch_sina_with_retries(fallback_codes)
-        histories.update(fallback_histories)
-        quotes.update(fallback_quotes)
-        errors = {**hk_errors, **fallback_errors}
     snapshot = daily_site.make_snapshot(universe, histories, quotes, now_china().strftime("%Y-%m-%d %H:%M:%S"))
     snapshot["stats"]["fetch_errors"] = len(errors)
     snapshot["fetch_error_codes"] = sorted(errors)
     snapshot["source_notes"] = [
-        "A股行情、总股本：腾讯行情接口；市值=最新价×总股本。港股使用腾讯港股行情，市值按港元口径；可靠市值缺失时留空。",
-        "沪深日线优先用腾讯前复权序列，缺失时及北交所日线改用新浪前复权序列；港股使用东方财富前复权序列；未复权历史不得纳入排名。",
+        "A股与港股实时行情、总股本：腾讯行情接口；市值=最新价×总股本。港股市值按港元口径；可靠市值缺失时留空。",
+        "A股与港股日线使用新浪前复权序列；若当日日线延迟，仅在腾讯报价确认开盘、最高、最低和成交量均有效时补入当日行情。",
+        "当日停牌或零成交股票不参与排名，并从有效覆盖率分母剔除；未复权历史不得纳入排名。",
         "A股与港股分别使用各自最近五个交易日，收益按首日开盘至第五日收盘计算。",
     ]
     stats = snapshot.get("stats", {})
-    if stats.get("universe", 0) and stats.get("eligible", 0) / stats["universe"] < 0.98:
+    active_universe = stats.get("universe", 0) - stats.get("no_trade", 0)
+    if active_universe and stats.get("eligible", 0) / active_universe < 0.98:
         raise SnapshotCoverageError(snapshot, errors)
     daily_site.validate_snapshot(snapshot)
     catalog = json.loads((root / "product_catalog.json").read_text(encoding="utf-8"))
@@ -156,13 +151,14 @@ def build_bundle_with_retries(
     now_fn=None,
     sleep_fn=None,
     builder=None,
-    log_fn=print,
+    log_fn=None,
     retry_seconds: int = 300,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Retry only temporary coverage failures every five minutes through 16:40."""
     now_fn = now_fn or now_china
     sleep_fn = sleep_fn or time.sleep
     builder = builder or build_bundle
+    log_fn = log_fn or (lambda message: print(message, flush=True))
     attempt = 0
     while True:
         attempt += 1
@@ -173,7 +169,14 @@ def build_bundle_with_retries(
                               ensure_ascii=False))
             local = now_fn().astimezone(CST)
             deadline = datetime.combine(local.date(), clock_time(16, 40), tzinfo=CST)
-            remaining = int((deadline - local).total_seconds())
+            release = datetime.combine(local.date(), clock_time(16, 10), tzinfo=CST)
+            if local < release:
+                next_attempt = release
+            else:
+                elapsed = (local - release).total_seconds()
+                next_attempt = release + timedelta(seconds=(int(elapsed // retry_seconds) + 1) * retry_seconds)
+            next_attempt = min(next_attempt, deadline)
+            remaining = int((next_attempt - local).total_seconds())
             if remaining <= 0:
                 raise
             sleep_fn(min(retry_seconds, remaining))
@@ -187,6 +190,7 @@ def main() -> int:
     if delay:
         print(f"Waiting {delay} seconds until 16:10 Asia/Shanghai before collecting market data", flush=True)
         time.sleep(delay)
+    print(json.dumps({"event": "collection_start", "at": now_china().isoformat()}, ensure_ascii=False), flush=True)
     bundle, errors = build_bundle_with_retries(Path(__file__).parent)
     snapshot = bundle["snapshot"]
     previous_as_of = ""
@@ -197,11 +201,11 @@ def main() -> int:
               "stats": snapshot["stats"], "fetch_error_codes": sorted(errors)}
     if not should_publish(snapshot["as_of"], previous_as_of, now_china()):
         result["unchanged"] = "no new trading session"
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(result, ensure_ascii=False), flush=True)
         return 0
     write_bundle(bundle, args.output)
     result["published"] = str(args.output)
-    print(json.dumps(result, ensure_ascii=False))
+    print(json.dumps(result, ensure_ascii=False), flush=True)
     return 0
 
 

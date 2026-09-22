@@ -3,6 +3,7 @@ from datetime import date
 import json
 from pathlib import Path
 import tempfile
+from unittest.mock import patch
 
 import daily_site
 
@@ -153,6 +154,23 @@ class MarketSourceTests(unittest.TestCase):
         self.assertEqual(result["adjustment"], "qfq_sina")
         self.assertEqual(result["bars"][0]["close"], 11)
 
+    def test_sina_hk_adjusted_frame_is_marked_qfq(self) -> None:
+        import pandas as pd
+        frame = pd.DataFrame([{"date": date(2026, 9, 22), "open": 23.5, "close": 24.1,
+                               "high": 24.2, "low": 23.4, "volume": 123456}])
+        result = daily_site.parse_sina_hk_adjusted_frame(frame, "00883.HK")
+        self.assertEqual(result["adjustment"], "qfq_sina_hk")
+        self.assertEqual(result["bars"][0]["date"], "2026-09-22")
+        self.assertEqual(result["bars"][0]["close"], 24.1)
+        self.assertIn("00883", result["history_url"])
+
+    def test_adjusted_history_dispatches_hk_to_sina_hk_adapter(self) -> None:
+        expected = {"bars": [], "adjustment": "qfq_sina_hk"}
+        with patch.object(daily_site, "fetch_sina_hk_adjusted", return_value=expected) as fetch:
+            result = daily_site.fetch_sina_adjusted_history("00883.HK")
+        self.assertIs(result, expected)
+        fetch.assert_called_once_with("00883.HK")
+
     def test_futures_trend_uses_five_complete_daily_bars(self) -> None:
         rows = [{"d": f"2026-09-{n:02d}", "o": "100", "c": str(100+n), "h": "120", "l": "90"} for n in range(13, 19)]
         result = daily_site.summarize_futures_trend(rows, "SC0", "上海原油期货")
@@ -176,13 +194,26 @@ class MarketSourceTests(unittest.TestCase):
         fields[1] = "测试化工"
         fields[2] = "600001"
         fields[3] = "25.00"
+        fields[5] = "24.50"
+        fields[6] = "1000"
         fields[30] = "20260918161500"
+        fields[33] = "25.50"
+        fields[34] = "24.00"
         fields[45] = "250.00"
         fields[73] = "1000000000"
         quote = daily_site.parse_tencent_quote('v_sh600001="' + '~'.join(fields) + '";', "600001.SH")
         self.assertEqual(quote["name"], "测试化工")
         self.assertEqual(quote["market_cap_yuan"], 25_000_000_000)
         self.assertEqual(quote["quote_at"], "2026-09-18 16:15:00")
+        self.assertTrue(quote["session_traded"])
+        self.assertEqual(quote["session_bar"]["open"], 24.5)
+
+    def test_live_session_bar_extends_delayed_adjusted_history(self) -> None:
+        history = {"bars": [bar("2026-09-21", 10, 11)], "adjustment": "qfq_sina_hk"}
+        quote = {"session_traded": True, "session_bar": bar("2026-09-22", 11, 12)}
+        merged = daily_site.merge_live_session_bar(history, quote)
+        self.assertEqual(merged["bars"][-1]["date"], "2026-09-22")
+        self.assertEqual(merged["adjustment"], "qfq_sina_hk_live")
 
     def test_tencent_history_requires_qfq_for_shenzhen_and_shanghai(self) -> None:
         payload = {"data": {"sz300243": {"qfqday": [
@@ -269,6 +300,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot.get("excluded_codes"), {
             "missing_history": ["600001.SH"],
             "stale_history": ["600002.SH"],
+            "no_trade": [],
             "missing_quote": ["600003.SH"],
             "stale_quote": ["600004.SH"],
             "missing_cap": ["600005.SH"],
@@ -342,6 +374,12 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["as_of"], "2026-09-17")
         finally:
             target.unlink(missing_ok=True)
+
+    def test_no_trade_names_are_excluded_from_active_coverage_denominator(self) -> None:
+        snapshot = {"as_of": "2026-09-22", "window_start": "2026-09-16",
+                    "stats": {"universe": 100, "eligible": 97, "no_trade": 3},
+                    "groups": {"bj": {"gainers": [{"code": "920001.BJ"}], "losers": []}}}
+        daily_site.validate_snapshot(snapshot)
 
     def test_product_output_is_atomically_valid_json(self) -> None:
         with tempfile.NamedTemporaryFile(dir=Path(__file__).parent, suffix=".json", delete=False) as handle:
