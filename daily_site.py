@@ -1,4 +1,4 @@
-"""Build the A-share five-trading-day site snapshot."""
+"""Build the A/H-share five-trading-day site snapshot."""
 
 from __future__ import annotations
 
@@ -67,37 +67,55 @@ def to_weekly_bars(bars: list[Bar]) -> list[Bar]:
 
 
 RANK_CONFIG = {
-    "chem_large": ("基础化工", 3),
-    "chem_small": ("基础化工", 5),
-    "oil": ("石油石化", 5),
-    "bj": ("北交所", 3),
+    "chem_large": ("基础化工", 3, 3),
+    "chem_small": ("基础化工", 5, 5),
+    "oil": ("石油石化", 5, 5),
+    "bj": ("北交所", 3, 3),
+    "hk": ("港股", 3, 2),
 }
 
 
 def select_rankings(rows: list[Row]) -> dict[str, dict[str, list[Row]]]:
     output: dict[str, dict[str, list[Row]]] = {}
-    for bucket, (group, limit) in RANK_CONFIG.items():
+    for bucket, (group, gain_limit, loss_limit) in RANK_CONFIG.items():
         eligible = [row for row in rows if row["group"] == group]
         if bucket == "chem_large":
             eligible = [row for row in eligible if row.get("market_cap_yuan") is not None and row["market_cap_yuan"] > 20_000_000_000]
         elif bucket == "chem_small":
             eligible = [row for row in eligible if row.get("market_cap_yuan") is not None and row["market_cap_yuan"] < 20_000_000_000]
         eligible = [row for row in eligible if row.get("return_pct") is not None]
-        gainers = sorted(eligible, key=lambda row: (-row["return_pct"], row["code"]))[:limit]
-        losers = sorted(eligible, key=lambda row: (row["return_pct"], row["code"]))[:limit]
+        gainers = sorted(eligible, key=lambda row: (-row["return_pct"], row["code"]))[:gain_limit]
+        losers = sorted(eligible, key=lambda row: (row["return_pct"], row["code"]))[:loss_limit]
         output[bucket] = {"gainers": gainers, "losers": losers}
     return output
 
 
+def normalize_code(code: str) -> str:
+    """Normalize supported exchange codes; HK tickers always use five digits."""
+    number, separator, market = code.strip().upper().partition(".")
+    if not separator or market not in {"SH", "SZ", "BJ", "HK"}:
+        raise ValueError(f"unsupported stock symbol: {code}")
+    if market == "HK":
+        if not re.fullmatch(r"\d{1,5}", number):
+            raise ValueError(f"invalid HK symbol: {code}")
+        number = number.zfill(5)
+    elif not re.fullmatch(r"\d{6}", number):
+        raise ValueError(f"invalid mainland symbol: {code}")
+    return f"{number}.{market}"
+
+
+def market_for_code(code: str) -> str:
+    return "HK" if normalize_code(code).endswith(".HK") else "CN"
+
+
 def tencent_symbol(code: str) -> str:
-    number, market = code.split(".")
-    if market not in {"SH", "SZ", "BJ"}:
-        raise ValueError(f"not an A-share symbol: {code}")
+    normalized = normalize_code(code)
+    number, market = normalized.split(".")
     return f"{market.lower()}{number}"
 
 
 def parse_tencent_quote(raw: str, code: str) -> dict[str, Any]:
-    """Parse an A-share quote; shares and last price determine total market cap."""
+    """Parse a Tencent quote and retain the native trading currency."""
     if not raw.startswith(f"v_{tencent_symbol(code)}="):
         raise ValueError(f"unexpected quote symbol for {code}")
     _, _, body = raw.partition('="')
@@ -105,18 +123,31 @@ def parse_tencent_quote(raw: str, code: str) -> dict[str, Any]:
     if len(fields) < 74:
         raise ValueError(f"incomplete quote for {code}")
     price = float(fields[3])
-    shares = float(fields[73])
-    if not (math.isfinite(price) and math.isfinite(shares) and price > 0 and shares > 0):
-        raise ValueError(f"invalid last price or shares for {code}")
-    stamp = datetime.strptime(fields[30], "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
-    cap = price * shares
+    if not (math.isfinite(price) and price > 0):
+        raise ValueError(f"invalid last price for {code}")
+    stamp_value = fields[30]
+    stamp_format = "%Y/%m/%d %H:%M:%S" if "/" in stamp_value else "%Y%m%d%H%M%S"
+    stamp = datetime.strptime(stamp_value, stamp_format).strftime("%Y-%m-%d %H:%M:%S")
+    is_hk = code.endswith(".HK")
     quoted_cap = float(fields[45]) * 100_000_000 if fields[45] else None
-    if quoted_cap is not None and abs(quoted_cap / cap - 1) > 0.02:
-        raise ValueError(f"total market cap does not match shares for {code}")
+    if is_hk:
+        cap = quoted_cap
+        currency = "HKD"
+    else:
+        shares = float(fields[73])
+        if not (math.isfinite(shares) and shares > 0):
+            raise ValueError(f"invalid total shares for {code}")
+        cap = price * shares
+        if quoted_cap is not None and abs(quoted_cap / cap - 1) > 0.02:
+            raise ValueError(f"total market cap does not match shares for {code}")
+        currency = "CNY"
     return {
         "name": fields[1] or code,
         "last_price": price,
-        "market_cap_yuan": cap,
+        "market_cap": cap,
+        "market_cap_yuan": None if is_hk else cap,
+        "currency": currency,
+        "market_cap_currency": currency,
         "quote_at": stamp,
         "quote_source": "Tencent quote",
         "quote_url": f"https://qt.gtimg.cn/q={tencent_symbol(code)}",
@@ -153,6 +184,34 @@ def parse_tencent_history(payload: dict[str, Any], code: str) -> dict[str, Any]:
     if not bars:
         raise ValueError(f"no valid history for {code}")
     return {"bars": sorted(bars, key=lambda item: item["date"]), "adjustment": adjustment}
+
+
+EASTMONEY_HK_HISTORY_URL = "https://33.push2his.eastmoney.com/api/qt/stock/kline/get"
+
+
+def parse_eastmoney_hk_history(payload: dict[str, Any], code: str) -> dict[str, Any]:
+    """Parse Eastmoney's fqt=1 HK series, which is explicitly forward adjusted."""
+    lines = payload.get("data", {}).get("klines") or []
+    bars = []
+    for line in lines:
+        try:
+            fields = str(line).split(",")
+            values = [float(fields[index]) for index in range(1, 6)]
+            if min(values[:4]) <= 0 or not all(math.isfinite(value) for value in values):
+                continue
+            bars.append({
+                "date": fields[0], "open": values[0], "close": values[1],
+                "high": values[2], "low": values[3], "volume": values[4],
+            })
+        except (IndexError, TypeError, ValueError):
+            continue
+    if not bars:
+        raise ValueError(f"Eastmoney HK qfq history unavailable for {code}")
+    return {
+        "bars": sorted(bars, key=lambda item: item["date"]),
+        "adjustment": "qfq_eastmoney",
+        "history_url": EASTMONEY_HK_HISTORY_URL,
+    }
 
 
 def parse_sina_bj_history(payload: list[dict[str, Any]]) -> dict[str, Any]:
@@ -232,10 +291,22 @@ def make_snapshot(
     quotes: dict[str, dict[str, Any]],
     generated_at: str,
 ) -> dict[str, Any]:
-    """Rank only stocks trading on the same latest five market sessions."""
-    all_dates = sorted({bar["date"] for item in histories.values() for bar in item.get("bars", [])})
-    dates = all_dates[-5:]
-    if len(dates) != 5:
+    """Rank stocks against separate latest five-session windows for CN and HK."""
+    market_windows: dict[str, dict[str, str]] = {}
+    market_dates: dict[str, list[str]] = {}
+    for market in ("CN", "HK"):
+        dates = sorted({
+            str(bar["date"])
+            for code, item in histories.items()
+            if market_for_code(code) == market
+            for bar in item.get("bars", [])
+        })[-5:]
+        if dates:
+            if len(dates) != 5:
+                raise ValueError(f"fewer than five {market} market sessions")
+            market_dates[market] = dates
+            market_windows[market] = {"window_start": dates[0], "as_of": dates[-1]}
+    if not market_windows:
         raise ValueError("fewer than five market sessions")
     stats = {"universe": 0, "eligible": 0, "missing_history": 0, "stale_history": 0,
              "missing_quote": 0, "stale_quote": 0, "missing_cap": 0, "unadjusted_history": 0}
@@ -250,6 +321,8 @@ def make_snapshot(
                 continue
             seen.add((group, code))
             stats["universe"] += 1
+            market = market_for_code(code)
+            dates = market_dates.get(market, [])
             history = histories.get(code)
             if not history or not history.get("bars"):
                 stats["missing_history"] += 1
@@ -274,7 +347,9 @@ def make_snapshot(
                 stats["stale_quote"] += 1
                 excluded_codes["stale_quote"].append(code)
                 continue
-            cap = quote.get("market_cap_yuan")
+            cap = quote.get("market_cap")
+            if cap is None and market == "CN":
+                cap = quote.get("market_cap_yuan")
             if cap is None:
                 stats["missing_cap"] += 1
                 excluded_codes["missing_cap"].append(code)
@@ -283,15 +358,22 @@ def make_snapshot(
             rows.append({
                 "code": code, "name": quote["name"], "group": group,
                 "return_pct": round(five_day_return([by_date[day] for day in dates]), 3),
-                "last_price": float(quote["last_price"]), "market_cap_yuan": cap,
+                "last_price": float(quote["last_price"]), "market_cap": cap,
+                "market_cap_yuan": cap if market == "CN" else None,
+                "market": market, "currency": quote.get("currency") or ("HKD" if market == "HK" else "CNY"),
+                "market_cap_currency": quote.get("market_cap_currency") or ("HKD" if market == "HK" else "CNY"),
+                "window_start": dates[0], "as_of": dates[-1],
                 "quote_at": quote.get("quote_at"), "quote_source": quote.get("quote_source"),
                 "quote_url": quote.get("quote_url"), "adjustment": history["adjustment"],
                 "daily": daily, "weekly": weekly,
                 "history_url": history.get("history_url") or f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={tencent_symbol(code)},day,,,260,qfq",
             })
             stats["eligible"] += 1
+    latest_as_of = max(window["as_of"] for window in market_windows.values())
+    earliest_start = min(window["window_start"] for window in market_windows.values())
     return {
-        "generated_at": generated_at, "as_of": dates[-1], "window_start": dates[0],
+        "generated_at": generated_at, "as_of": latest_as_of, "window_start": earliest_start,
+        "market_windows": market_windows,
         "method": "first session open to fifth session close",
         "groups": select_rankings(rows), "stats": stats, "excluded_codes": excluded_codes,
     }
@@ -332,7 +414,12 @@ def write_products(products: dict[str, dict[str, str]], target: str | Path) -> N
         temp.unlink(missing_ok=True)
 
 
-UNIVERSE_FILES = {"基础化工": "基础化工list.txt", "石油石化": "石油石化list.txt", "北交所": "北交所.txt"}
+UNIVERSE_FILES = {
+    "基础化工": "基础化工list.txt",
+    "石油石化": "石油石化list.txt",
+    "北交所": "北交所.txt",
+    "港股": "H股list.txt",
+}
 
 
 def load_universe(root: str | Path) -> dict[str, list[str]]:
@@ -341,8 +428,11 @@ def load_universe(root: str | Path) -> dict[str, list[str]]:
     for group, filename in UNIVERSE_FILES.items():
         codes = []
         for line in (root / filename).read_text(encoding="utf-8-sig").splitlines():
-            code = line.strip().upper()
-            if re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", code) and code not in codes:
+            try:
+                code = normalize_code(line)
+            except ValueError:
+                continue
+            if code not in codes:
                 codes.append(code)
         output[group] = codes
     return output
@@ -361,9 +451,19 @@ def fetch_market_data(codes: list[str], workers: int = 10) -> tuple[dict[str, di
         errors = []
         for attempt in range(3):
             try:
-                h = session.get(history_url, timeout=16)
-                h.raise_for_status()
-                history = parse_tencent_history(h.json(), code)
+                if code.endswith(".HK"):
+                    h = session.get(EASTMONEY_HK_HISTORY_URL, params={
+                        "secid": f"116.{code.split('.')[0]}",
+                        "fields1": "f1,f2,f3,f4,f5,f6",
+                        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                        "klt": "101", "fqt": "1", "end": "20500000", "lmt": "260",
+                    }, timeout=16)
+                    h.raise_for_status()
+                    history = parse_eastmoney_hk_history(h.json(), code)
+                else:
+                    h = session.get(history_url, timeout=16)
+                    h.raise_for_status()
+                    history = parse_tencent_history(h.json(), code)
                 if code.endswith(".BJ") and len(history["bars"]) < 60:
                     sina = session.get("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketData.getKLineData",
                                        params={"symbol": symbol, "scale": "240", "ma": "no", "datalen": "260"}, timeout=16)

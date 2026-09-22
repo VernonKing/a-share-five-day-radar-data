@@ -1,4 +1,4 @@
-"""Publish a validated A-share five-session bundle from a cloud runner."""
+"""Publish a validated A/H-share five-session bundle from a cloud runner."""
 
 from __future__ import annotations
 
@@ -14,7 +14,13 @@ import daily_site
 
 
 CST = timezone(timedelta(hours=8), name="Asia/Shanghai")
-RANK_COUNTS = {"chem_large": 3, "chem_small": 5, "oil": 5, "bj": 3}
+RANK_COUNTS = {
+    "chem_large": {"gainers": 3, "losers": 3},
+    "chem_small": {"gainers": 5, "losers": 5},
+    "oil": {"gainers": 5, "losers": 5},
+    "bj": {"gainers": 3, "losers": 3},
+    "hk": {"gainers": 3, "losers": 2},
+}
 
 
 class SnapshotCoverageError(ValueError):
@@ -39,17 +45,26 @@ def validate_bundle(bundle: dict[str, Any]) -> None:
     if not isinstance(snapshot, dict) or not isinstance(bundle.get("products"), dict):
         raise ValueError("bundle requires snapshot and products")
     daily_site.validate_snapshot(snapshot)
-    as_of = snapshot["as_of"]
-    for bucket, required in RANK_COUNTS.items():
+    windows = snapshot.get("market_windows", {})
+    for market in ("CN", "HK"):
+        window = windows.get(market, {})
+        if not window.get("as_of") or not window.get("window_start"):
+            raise ValueError(f"missing {market} market window")
+    for bucket, required_by_side in RANK_COUNTS.items():
         group = snapshot.get("groups", {}).get(bucket, {})
         for side in ("gainers", "losers"):
             rows = group.get(side)
+            required = required_by_side[side]
             if not isinstance(rows, list) or len(rows) != required:
                 raise ValueError(f"incomplete rankings: {bucket}/{side} requires {required}")
             for row in rows:
+                market = row.get("market") or ("HK" if str(row.get("code", "")).endswith(".HK") else "CN")
+                as_of = windows[market]["as_of"]
+                if row.get("as_of") not in {None, as_of}:
+                    raise ValueError(f"wrong market window in {bucket}/{side}: {row.get('code')}")
                 if not str(row.get("quote_at", "")).startswith(as_of):
                     raise ValueError(f"stale quote in {bucket}/{side}: {row.get('code')}")
-                if row.get("adjustment") not in {"qfq", "qfq_sina"}:
+                if row.get("adjustment") not in {"qfq", "qfq_sina", "qfq_eastmoney"}:
                     raise ValueError(f"unadjusted history in {bucket}/{side}: {row.get('code')}")
                 if bucket == "bj" and row.get("adjustment") != "qfq_sina":
                     raise ValueError(f"BJ adjusted history required: {row.get('code')}")
@@ -63,7 +78,7 @@ def should_publish(as_of: str, previous_as_of: str, current: datetime) -> bool:
 
 def seconds_until_release(current: datetime) -> int:
     local = current.astimezone(CST)
-    release = datetime.combine(local.date(), clock_time(16, 0), tzinfo=CST)
+    release = datetime.combine(local.date(), clock_time(16, 10), tzinfo=CST)
     return max(0, int((release - local).total_seconds()))
 
 
@@ -108,19 +123,21 @@ def build_bundle(root: Path) -> tuple[dict[str, Any], dict[str, str]]:
         histories.update(retry_histories)
         quotes.update(retry_quotes)
         errors = retry_errors
-    fallback_codes = sorted(set(errors) | {code for code in codes if code.endswith(".BJ")})
+    hk_errors = {code: message for code, message in errors.items() if code.endswith(".HK")}
+    fallback_codes = sorted({code for code in errors if not code.endswith(".HK")} |
+                            {code for code in codes if code.endswith(".BJ")})
     if fallback_codes:
         fallback_histories, fallback_quotes, fallback_errors = fetch_sina_with_retries(fallback_codes)
         histories.update(fallback_histories)
         quotes.update(fallback_quotes)
-        errors = fallback_errors
+        errors = {**hk_errors, **fallback_errors}
     snapshot = daily_site.make_snapshot(universe, histories, quotes, now_china().strftime("%Y-%m-%d %H:%M:%S"))
     snapshot["stats"]["fetch_errors"] = len(errors)
     snapshot["fetch_error_codes"] = sorted(errors)
     snapshot["source_notes"] = [
-        "行情、总股本：腾讯行情接口；市值=最新价×总股本。",
-        "沪深日线优先用腾讯前复权序列，缺失时及北交所日线改用新浪前复权序列；未复权历史不得纳入排名。",
-        "所有收益按同一组最近五个交易日的首日开盘至第五日收盘计算。",
+        "A股行情、总股本：腾讯行情接口；市值=最新价×总股本。港股使用腾讯港股行情，市值按港元口径；可靠市值缺失时留空。",
+        "沪深日线优先用腾讯前复权序列，缺失时及北交所日线改用新浪前复权序列；港股使用东方财富前复权序列；未复权历史不得纳入排名。",
+        "A股与港股分别使用各自最近五个交易日，收益按首日开盘至第五日收盘计算。",
     ]
     stats = snapshot.get("stats", {})
     if stats.get("universe", 0) and stats.get("eligible", 0) / stats["universe"] < 0.98:
@@ -142,7 +159,7 @@ def build_bundle_with_retries(
     log_fn=print,
     retry_seconds: int = 300,
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    """Retry only temporary coverage failures through 16:30 China time."""
+    """Retry only temporary coverage failures every five minutes through 16:40."""
     now_fn = now_fn or now_china
     sleep_fn = sleep_fn or time.sleep
     builder = builder or build_bundle
@@ -155,7 +172,7 @@ def build_bundle_with_retries(
             log_fn(json.dumps({"event": "coverage_retry", "attempt": attempt, **exc.diagnostics},
                               ensure_ascii=False))
             local = now_fn().astimezone(CST)
-            deadline = datetime.combine(local.date(), clock_time(16, 30), tzinfo=CST)
+            deadline = datetime.combine(local.date(), clock_time(16, 40), tzinfo=CST)
             remaining = int((deadline - local).total_seconds())
             if remaining <= 0:
                 raise
@@ -163,12 +180,12 @@ def build_bundle_with_retries(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Refresh the public five-session A-share data bundle")
+    parser = argparse.ArgumentParser(description="Refresh the public five-session A/H-share data bundle")
     parser.add_argument("--output", type=Path, default=Path(__file__).with_name("latest.json"))
     args = parser.parse_args()
     delay = seconds_until_release(now_china())
     if delay:
-        print(f"Waiting {delay} seconds until 16:00 Asia/Shanghai before collecting market data", flush=True)
+        print(f"Waiting {delay} seconds until 16:10 Asia/Shanghai before collecting market data", flush=True)
         time.sleep(delay)
     bundle, errors = build_bundle_with_retries(Path(__file__).parent)
     snapshot = bundle["snapshot"]

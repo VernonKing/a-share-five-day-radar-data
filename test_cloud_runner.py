@@ -14,15 +14,27 @@ CST = timezone(timedelta(hours=8))
 
 def sample_snapshot():
     groups = {}
-    for key, count in {"chem_large": 3, "chem_small": 5, "oil": 5, "bj": 3}.items():
-        rows = []
-        for index in range(count):
-            code = f"{index:06d}.BJ" if key == "bj" else f"{index:06d}.SH"
-            rows.append({"code": code, "name": "样本", "return_pct": float(index),
-                         "quote_at": "2026-09-18 15:01:00", "adjustment": "qfq_sina" if key == "bj" else "qfq",
-                         "daily": [{"date": "2026-09-18"}], "weekly": [{"date": "2026-09-18"}]})
-        groups[key] = {"gainers": rows, "losers": list(reversed(rows))}
+    for key, counts in {"chem_large": (3, 3), "chem_small": (5, 5), "oil": (5, 5),
+                        "bj": (3, 3), "hk": (3, 2)}.items():
+        sides = {}
+        for side, count in zip(("gainers", "losers"), counts):
+            rows = []
+            for index in range(count):
+                code = f"{index:05d}.HK" if key == "hk" else (
+                    f"{index:06d}.BJ" if key == "bj" else f"{index:06d}.SH")
+                rows.append({"code": code, "name": "样本", "return_pct": float(index),
+                             "market": "HK" if key == "hk" else "CN",
+                             "currency": "HKD" if key == "hk" else "CNY",
+                             "as_of": "2026-09-18", "window_start": "2026-09-14",
+                             "quote_at": "2026-09-18 15:01:00",
+                             "adjustment": "qfq_sina" if key == "bj" else (
+                                 "qfq_eastmoney" if key == "hk" else "qfq"),
+                             "daily": [{"date": "2026-09-18"}], "weekly": [{"date": "2026-09-18"}]})
+            sides[side] = rows
+        groups[key] = sides
     return {"as_of": "2026-09-18", "window_start": "2026-09-14",
+            "market_windows": {"CN": {"window_start": "2026-09-14", "as_of": "2026-09-18"},
+                               "HK": {"window_start": "2026-09-14", "as_of": "2026-09-18"}},
             "generated_at": "2026-09-18 16:00:00", "stats": {"universe": 580, "eligible": 580},
             "groups": groups}
 
@@ -46,7 +58,7 @@ class CloudPublicationTests(unittest.TestCase):
 
     def test_low_coverage_retries_after_five_minutes_then_returns_success(self):
         self.assertTrue(hasattr(runner, "build_bundle_with_retries"))
-        current = datetime(2026, 9, 21, 16, 2, tzinfo=CST)
+        current = datetime(2026, 9, 21, 16, 12, tzinfo=CST)
         sleeps = []
         attempts = []
         logs = []
@@ -78,7 +90,7 @@ class CloudPublicationTests(unittest.TestCase):
 
     def test_low_coverage_retries_at_deadline_then_raises(self):
         self.assertTrue(hasattr(runner, "build_bundle_with_retries"))
-        current = datetime(2026, 9, 21, 16, 29, tzinfo=CST)
+        current = datetime(2026, 9, 21, 16, 39, tzinfo=CST)
         sleeps = []
         attempts = []
 
@@ -102,7 +114,7 @@ class CloudPublicationTests(unittest.TestCase):
         self.assertEqual(sleeps, [60])
         self.assertEqual(len(attempts), 2)
 
-    def test_main_waits_until_16_before_collecting_market_data(self):
+    def test_main_waits_until_1610_before_collecting_market_data(self):
         with tempfile.NamedTemporaryFile(dir=Path(__file__).parent, suffix=".json", delete=False) as handle:
             target = Path(handle.name)
         current = datetime(2026, 9, 21, 15, 42, tzinfo=CST)
@@ -128,7 +140,7 @@ class CloudPublicationTests(unittest.TestCase):
                     patch.object(runner, "build_bundle", side_effect=build), \
                     patch.object(runner, "write_bundle"):
                 runner.main()
-            self.assertEqual(events[0], ("sleep", 18 * 60))
+            self.assertEqual(events[0], ("sleep", 28 * 60))
             self.assertEqual(events[1][0], "build")
         finally:
             target.unlink(missing_ok=True)
@@ -155,6 +167,19 @@ class CloudPublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rankings|榜单"):
             runner.validate_bundle(broken)
 
+    def test_bundle_validation_uses_each_market_window(self):
+        bundle = {"snapshot": sample_snapshot(), "products": {}}
+        snapshot = bundle["snapshot"]
+        snapshot["as_of"] = "2026-09-21"
+        snapshot["market_windows"]["HK"] = {"window_start": "2026-09-15", "as_of": "2026-09-21"}
+        for side in ("gainers", "losers"):
+            for row in snapshot["groups"]["hk"][side]:
+                row["as_of"] = "2026-09-21"
+                row["window_start"] = "2026-09-15"
+                row["quote_at"] = "2026-09-21 16:11:00"
+                row["daily"][-1]["date"] = "2026-09-21"
+        runner.validate_bundle(bundle)
+
     def test_bundle_validation_rejects_stale_quote_and_low_coverage(self):
         bundle = {"snapshot": sample_snapshot(), "products": {}}
         broken = copy.deepcopy(bundle)
@@ -172,9 +197,10 @@ class CloudPublicationTests(unittest.TestCase):
         self.assertTrue(runner.should_publish("2026-09-21", "2026-09-18", now))
         self.assertFalse(runner.should_publish("2026-09-22", "2026-09-18", now))
 
-    def test_wait_until_16_china_time(self):
-        self.assertEqual(runner.seconds_until_release(datetime(2026, 9, 21, 15, 42, tzinfo=CST)), 18 * 60)
-        self.assertEqual(runner.seconds_until_release(datetime(2026, 9, 21, 16, 5, tzinfo=CST)), 0)
+    def test_wait_until_1610_china_time(self):
+        self.assertEqual(runner.seconds_until_release(datetime(2026, 9, 21, 15, 42, tzinfo=CST)), 28 * 60)
+        self.assertEqual(runner.seconds_until_release(datetime(2026, 9, 21, 16, 5, tzinfo=CST)), 5 * 60)
+        self.assertEqual(runner.seconds_until_release(datetime(2026, 9, 21, 16, 10, tzinfo=CST)), 0)
 
     def test_atomic_write_does_not_replace_previous_bundle_on_validation_failure(self):
         with tempfile.NamedTemporaryFile(dir=Path(__file__).parent, suffix=".json", delete=False) as handle:
