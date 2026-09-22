@@ -1,0 +1,39 @@
+name: Daily A/H-share refresh
+
+on:
+  schedule:
+    # 16:00 Asia/Shanghai; runner waits until 16:10 before the first collection.
+    - cron: '0 8 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-market-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Collect, validate and publish the latest bundle
+        run: python runner.py --output latest.json
+      - name: Commit a new trading session only
+        run: |
+          if git diff --quiet -- latest.json; then
+            echo "No new validated trading session."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add latest.json
+          git commit -m "data: refresh A/H-share session"
+          git push
