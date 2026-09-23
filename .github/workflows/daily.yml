@@ -1,4 +1,4 @@
-name: Daily A/H-share refresh
+name: Daily A-share refresh
 
 on:
   schedule:
@@ -35,5 +35,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add latest.json
-          git commit -m "data: refresh A/H-share session"
+          git commit -m "data: refresh A-share session"
           git push
