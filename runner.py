@@ -1,4 +1,4 @@
-"""Publish a validated A/H-share five-session bundle from a cloud runner."""
+"""Publish a validated A-share five-session bundle from a cloud runner."""
 
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ RANK_COUNTS = {
     "chem_small": {"gainers": 5, "losers": 5},
     "oil": {"gainers": 5, "losers": 5},
     "bj": {"gainers": 3, "losers": 3},
-    "hk": {"gainers": 3, "losers": 2},
 }
 
 
@@ -46,7 +45,7 @@ def validate_bundle(bundle: dict[str, Any]) -> None:
         raise ValueError("bundle requires snapshot and products")
     daily_site.validate_snapshot(snapshot)
     windows = snapshot.get("market_windows", {})
-    for market in ("CN", "HK"):
+    for market in ("CN",):
         window = windows.get(market, {})
         if not window.get("as_of") or not window.get("window_start"):
             raise ValueError(f"missing {market} market window")
@@ -58,14 +57,13 @@ def validate_bundle(bundle: dict[str, Any]) -> None:
             if not isinstance(rows, list) or len(rows) != required:
                 raise ValueError(f"incomplete rankings: {bucket}/{side} requires {required}")
             for row in rows:
-                market = row.get("market") or ("HK" if str(row.get("code", "")).endswith(".HK") else "CN")
+                market = row.get("market") or "CN"
                 as_of = windows[market]["as_of"]
                 if row.get("as_of") not in {None, as_of}:
                     raise ValueError(f"wrong market window in {bucket}/{side}: {row.get('code')}")
                 if not str(row.get("quote_at", "")).startswith(as_of):
                     raise ValueError(f"stale quote in {bucket}/{side}: {row.get('code')}")
-                if row.get("adjustment") not in {"qfq", "qfq_sina", "qfq_sina_live", "qfq_sina_hk",
-                                                 "qfq_sina_hk_live", "qfq_eastmoney"}:
+                if row.get("adjustment") not in {"qfq", "qfq_sina", "qfq_sina_live"}:
                     raise ValueError(f"unadjusted history in {bucket}/{side}: {row.get('code')}")
                 if bucket == "bj" and row.get("adjustment") not in {"qfq_sina", "qfq_sina_live"}:
                     raise ValueError(f"BJ adjusted history required: {row.get('code')}")
@@ -128,10 +126,10 @@ def build_bundle(root: Path) -> tuple[dict[str, Any], dict[str, str]]:
     snapshot["stats"]["fetch_errors"] = len(errors)
     snapshot["fetch_error_codes"] = sorted(errors)
     snapshot["source_notes"] = [
-        "A股与港股实时行情、总股本：腾讯行情接口；市值=最新价×总股本。港股市值按港元口径；可靠市值缺失时留空。",
-        "A股与港股日线使用新浪前复权序列；若当日日线延迟，仅在腾讯报价确认开盘、最高、最低和成交量均有效时补入当日行情。",
+        "A股实时行情、总股本：腾讯行情接口；市值=最新价×总股本。",
+        "A股日线使用新浪前复权序列；若当日日线延迟，仅在腾讯报价确认开盘、最高、最低和成交量均有效时补入当日行情。",
         "当日停牌或零成交股票不参与排名，并从有效覆盖率分母剔除；未复权历史不得纳入排名。",
-        "A股与港股分别使用各自最近五个交易日，收益按首日开盘至第五日收盘计算。",
+        "A股使用最近五个交易日，收益按首日开盘至第五日收盘计算。",
     ]
     stats = snapshot.get("stats", {})
     active_universe = stats.get("universe", 0) - stats.get("no_trade", 0)
@@ -183,7 +181,7 @@ def build_bundle_with_retries(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Refresh the public five-session A/H-share data bundle")
+    parser = argparse.ArgumentParser(description="Refresh the public five-session A-share data bundle")
     parser.add_argument("--output", type=Path, default=Path(__file__).with_name("latest.json"))
     args = parser.parse_args()
     delay = seconds_until_release(now_china())

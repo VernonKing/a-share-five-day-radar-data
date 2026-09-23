@@ -66,15 +66,10 @@ class MovingAverageTests(unittest.TestCase):
 
 
 class RankingTests(unittest.TestCase):
-    def test_hk_uses_three_gainers_and_two_losers_without_market_cap(self) -> None:
-        rows = [
-            {"code": f"{index:05d}.HK", "group": "港股", "market_cap": None,
-             "return_pct": value}
-            for index, value in enumerate([8, 6, 4, 2, -1, -3], start=1)
-        ]
-        ranked = daily_site.select_rankings(rows)["hk"]
-        self.assertEqual([row["return_pct"] for row in ranked["gainers"]], [8, 6, 4])
-        self.assertEqual([row["return_pct"] for row in ranked["losers"]], [-3, -1])
+    def test_rankings_expose_only_four_a_share_buckets(self) -> None:
+        self.assertEqual(set(daily_site.select_rankings([])), {
+            "chem_large", "chem_small", "oil", "bj",
+        })
 
     def test_small_pool_keeps_independent_top_and_bottom(self) -> None:
         rows = [{"code": f"O{i}", "group": "石油石化", "market_cap_yuan": 1,
@@ -240,38 +235,28 @@ class MarketSourceTests(unittest.TestCase):
 
 
 class SnapshotTests(unittest.TestCase):
-    def test_snapshot_uses_independent_cn_and_hk_five_session_windows(self) -> None:
+    def test_snapshot_uses_cn_five_session_window_only(self) -> None:
         cn_days = ["2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18"]
-        hk_days = ["2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21"]
         histories = {
             "600001.SH": {"bars": [bar(day, 10, 11) for day in cn_days], "adjustment": "qfq"},
-            "00166.HK": {"bars": [bar(day, 20, 22) for day in hk_days], "adjustment": "qfq"},
         }
         quotes = {
             "600001.SH": {"name": "沪股", "last_price": 11, "market_cap_yuan": 30_000_000_000,
                           "market_cap": 30_000_000_000, "market_cap_currency": "CNY",
                           "currency": "CNY", "quote_at": "2026-09-18 16:00:00"},
-            "00166.HK": {"name": "港股", "last_price": 22, "market_cap_yuan": None,
-                         "market_cap": None, "market_cap_currency": "HKD",
-                         "currency": "HKD", "quote_at": "2026-09-21 16:15:00"},
         }
         snapshot = daily_site.make_snapshot(
-            {"基础化工": ["600001.SH"], "港股": ["00166.HK"]}, histories, quotes,
-            "2026-09-21 16:20:00")
+            {"基础化工": ["600001.SH"]}, histories, quotes, "2026-09-18 16:20:00")
         self.assertEqual(snapshot["market_windows"], {
             "CN": {"window_start": "2026-09-14", "as_of": "2026-09-18"},
-            "HK": {"window_start": "2026-09-15", "as_of": "2026-09-21"},
         })
-        hk = snapshot["groups"]["hk"]["gainers"][0]
-        self.assertEqual((hk["market"], hk["currency"]), ("HK", "HKD"))
-        self.assertEqual((hk["window_start"], hk["as_of"]), ("2026-09-15", "2026-09-21"))
-        self.assertEqual(snapshot["as_of"], "2026-09-21")
+        self.assertNotIn("hk", snapshot["groups"])
+        self.assertEqual(snapshot["as_of"], "2026-09-18")
 
-    def test_load_universe_normalizes_hk_codes(self) -> None:
-        codes = daily_site.load_universe(Path(__file__).parent)["港股"]
-        self.assertEqual(codes[0], "00166.HK")
-        self.assertIn("80883.HK", codes)
-        self.assertEqual(len(codes), 68)
+    def test_load_universe_contains_no_hk_group_or_codes(self) -> None:
+        universe = daily_site.load_universe(Path(__file__).parent)
+        self.assertNotIn("港股", universe)
+        self.assertFalse(any(code.endswith(".HK") for codes in universe.values() for code in codes))
 
     def test_snapshot_records_every_excluded_code_by_reason(self) -> None:
         days = ["2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18"]

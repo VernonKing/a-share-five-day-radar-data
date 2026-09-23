@@ -15,26 +15,22 @@ CST = timezone(timedelta(hours=8))
 def sample_snapshot():
     groups = {}
     for key, counts in {"chem_large": (3, 3), "chem_small": (5, 5), "oil": (5, 5),
-                        "bj": (3, 3), "hk": (3, 2)}.items():
+                        "bj": (3, 3)}.items():
         sides = {}
         for side, count in zip(("gainers", "losers"), counts):
             rows = []
             for index in range(count):
-                code = f"{index:05d}.HK" if key == "hk" else (
-                    f"{index:06d}.BJ" if key == "bj" else f"{index:06d}.SH")
+                code = f"{index:06d}.BJ" if key == "bj" else f"{index:06d}.SH"
                 rows.append({"code": code, "name": "样本", "return_pct": float(index),
-                             "market": "HK" if key == "hk" else "CN",
-                             "currency": "HKD" if key == "hk" else "CNY",
+                             "market": "CN", "currency": "CNY",
                              "as_of": "2026-09-18", "window_start": "2026-09-14",
                              "quote_at": "2026-09-18 15:01:00",
-                             "adjustment": "qfq_sina" if key == "bj" else (
-                                 "qfq_sina_hk" if key == "hk" else "qfq"),
+                             "adjustment": "qfq_sina" if key == "bj" else "qfq",
                              "daily": [{"date": "2026-09-18"}], "weekly": [{"date": "2026-09-18"}]})
             sides[side] = rows
         groups[key] = sides
     return {"as_of": "2026-09-18", "window_start": "2026-09-14",
-            "market_windows": {"CN": {"window_start": "2026-09-14", "as_of": "2026-09-18"},
-                               "HK": {"window_start": "2026-09-14", "as_of": "2026-09-18"}},
+            "market_windows": {"CN": {"window_start": "2026-09-14", "as_of": "2026-09-18"}},
             "generated_at": "2026-09-18 16:00:00", "stats": {"universe": 580, "eligible": 580},
             "groups": groups}
 
@@ -168,17 +164,9 @@ class CloudPublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rankings|榜单"):
             runner.validate_bundle(broken)
 
-    def test_bundle_validation_uses_each_market_window(self):
+    def test_bundle_validation_uses_cn_market_window(self):
         bundle = {"snapshot": sample_snapshot(), "products": {}}
         snapshot = bundle["snapshot"]
-        snapshot["as_of"] = "2026-09-21"
-        snapshot["market_windows"]["HK"] = {"window_start": "2026-09-15", "as_of": "2026-09-21"}
-        for side in ("gainers", "losers"):
-            for row in snapshot["groups"]["hk"][side]:
-                row["as_of"] = "2026-09-21"
-                row["window_start"] = "2026-09-15"
-                row["quote_at"] = "2026-09-21 16:11:00"
-                row["daily"][-1]["date"] = "2026-09-21"
         runner.validate_bundle(bundle)
 
     def test_bundle_validation_rejects_stale_quote_and_low_coverage(self):

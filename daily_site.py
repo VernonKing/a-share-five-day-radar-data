@@ -1,4 +1,4 @@
-"""Build the A/H-share five-trading-day site snapshot."""
+"""Build the A-share five-trading-day site snapshot."""
 
 from __future__ import annotations
 
@@ -71,7 +71,6 @@ RANK_CONFIG = {
     "chem_small": ("基础化工", 5, 5),
     "oil": ("石油石化", 5, 5),
     "bj": ("北交所", 3, 3),
-    "hk": ("港股", 3, 2),
 }
 
 
@@ -359,10 +358,10 @@ def make_snapshot(
     quotes: dict[str, dict[str, Any]],
     generated_at: str,
 ) -> dict[str, Any]:
-    """Rank stocks against separate latest five-session windows for CN and HK."""
+    """Rank stocks against the latest five-session mainland window."""
     market_windows: dict[str, dict[str, str]] = {}
     market_dates: dict[str, list[str]] = {}
-    for market in ("CN", "HK"):
+    for market in ("CN",):
         dates = sorted({
             str(bar["date"])
             for code, item in histories.items()
@@ -494,7 +493,6 @@ UNIVERSE_FILES = {
     "基础化工": "基础化工list.txt",
     "石油石化": "石油石化list.txt",
     "北交所": "北交所.txt",
-    "港股": "H股list.txt",
 }
 
 
@@ -650,7 +648,7 @@ def main() -> int:
     snapshot["fetch_error_codes"] = sorted(errors)
     snapshot["source_notes"] = [
         "实时行情、总股本：腾讯行情接口；市值=最新价×总股本。",
-        "A股与港股日线使用新浪前复权序列；若当日日线延迟，仅在腾讯报价确认当日有成交时补入当日行情。",
+        "A股日线使用新浪前复权序列；若当日日线延迟，仅在腾讯报价确认当日有成交时补入当日行情。",
         "当日停牌或零成交股票不参与排名，并从有效覆盖率分母剔除；未复权历史不得纳入排名。",
         "所有收益按同一组最近五个交易日的首日开盘至第五日收盘计算。",
     ]
