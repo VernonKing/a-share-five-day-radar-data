@@ -7,6 +7,10 @@ on:
     # Backup starts at Beijing 16:20, 16:35 and 17:15.
     - cron: '20,35 8 * * 1-5'
     - cron: '15 9 * * 1-5'
+    # Additional off-hour backups: Beijing 16:47, 17:23 and 18:11.
+    - cron: '47 8 * * 1-5'
+    - cron: '23 9 * * 1-5'
+    - cron: '11 10 * * 1-5'
   workflow_dispatch:
 
 permissions:
